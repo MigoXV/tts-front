@@ -34,8 +34,7 @@ async def play_stream_with_latency(
     accumulated_header = b""
     data_start_offset = 0
 
-    # 音频数据列表
-    audio_chunks = []
+    stream = None
 
     def parse_wav_header(data: bytes):
         """解析 WAV 头部获取音频参数"""
@@ -76,25 +75,18 @@ async def play_stream_with_latency(
 
         return None
 
-    def process_pcm_data(
-        pcm_data: bytes, dtype, bits_per_sample: int, channels: int
-    ) -> np.ndarray:
-        """将PCM数据转换为归一化的numpy数组"""
-        audio_array = np.frombuffer(pcm_data, dtype=dtype)
-
-        # 归一化
-        if bits_per_sample == 16:
-            audio_array = audio_array.astype(np.float32) / 32768.0
-        elif bits_per_sample == 24 or bits_per_sample == 32:
-            audio_array = audio_array.astype(np.float32) / 2147483648.0
-
-        # 确保形状正确
-        if channels == 1:
-            audio_array = audio_array.reshape(-1, 1)
-        else:
-            audio_array = audio_array.reshape(-1, channels)
-
-        return audio_array
+    def open_output_stream():
+        nonlocal stream
+        if stream is not None:
+            return
+        if dtype is None or sample_rate is None or channels is None:
+            return
+        stream = sd.RawOutputStream(
+            samplerate=sample_rate,
+            channels=channels,
+            dtype=dtype,
+        )
+        stream.start()
 
     print("接收音频数据中...")
 
@@ -141,6 +133,7 @@ async def play_stream_with_latency(
                         offset += 8 + chunk_size
 
                     header_parsed = True
+                    open_output_stream()
 
                     # 处理头部后的剩余数据
                     if len(accumulated_header) > data_start_offset:
@@ -159,21 +152,13 @@ async def play_stream_with_latency(
                 bytes_to_process = complete_samples * bytes_per_sample
                 pcm_data = sample_buffer[:bytes_to_process]
                 sample_buffer = sample_buffer[bytes_to_process:]
-
-                audio_array = process_pcm_data(
-                    pcm_data, dtype, bits_per_sample, channels
-                )
-                audio_chunks.append(audio_array)
+                if stream is not None:
+                    stream.write(pcm_data)
 
     print(f"数据接收完成，总共接收: {full_audio.tell()} 字节")
-    print("开始播放...")
-
-    # 合并所有音频数据并播放
-    if audio_chunks:
-        full_audio_array = np.vstack(audio_chunks)
-        sd.play(full_audio_array, samplerate=sample_rate)
-        sd.wait()
-
+    if stream is not None:
+        stream.stop()
+        stream.close()
     print("播放完成！")
     if first_chunk_time is None:
         return -1.0
@@ -190,16 +175,16 @@ async def main():
         ]
     )
 
-    print("不启用分句：测试首包延迟")
-    latency_no_split = await play_stream_with_latency(
-        inferencer=inferencer,
-        text=test_text,
-        model="miratts",
-        voice="rita",
-        enable_split=False,
-    )
-    print(f"首包延迟(不分句): {latency_no_split:.3f} s")
-    print("=" * 60)
+    # print("不启用分句：测试首包延迟")
+    # latency_no_split = await play_stream_with_latency(
+    #     inferencer=inferencer,
+    #     text=test_text,
+    #     model="miratts",
+    #     voice="rita",
+    #     enable_split=False,
+    # )
+    # print(f"首包延迟(不分句): {latency_no_split:.3f} s")
+    # print("=" * 60)
 
     print("启用分句：测试首包延迟")
     latency_split = await play_stream_with_latency(

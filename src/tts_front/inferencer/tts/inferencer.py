@@ -1,26 +1,30 @@
-from typing import Tuple
+import asyncio
+from collections.abc import AsyncIterator
+from typing import Dict, Tuple
 
 import numpy as np
 import openai
-from collections.abc import AsyncIterator
-import asyncio
-from .wav_parser import parse_wav_bytes
-from .llm_prompt import LLM_NORMALIZE_SYSTEM_PROMPT, LLM_NORMALIZE_USER_TEMPLATE
+
+from .llm_prompt import (LLM_NORMALIZE_SYSTEM_PROMPT,
+                         LLM_NORMALIZE_USER_TEMPLATE)
+from .postprocessor import AudioPostProcessor
 from .text_preprocessor import TextNormalizer
+from .wav_parser import parse_wav_bytes
 
 
 class AsyncInferencer:
     """异步推理器"""
 
-    def __init__(self):
+    def __init__(self, voice_map: Dict[str, str] = {}):
         self.client = openai.AsyncOpenAI()
         self.normalizer = TextNormalizer()
+        self.voice_map = voice_map
 
     async def infer(self, text: str, model: str, voice: str) -> Tuple[np.ndarray, int]:
         text = self.normalizer.normalize(text)
         audio_data = await self.client.audio.speech.create(
             model=model,
-            voice=voice,
+            voice=self.voice_map.get(voice, voice),
             input=text,
             response_format="wav",
         )
@@ -47,29 +51,51 @@ class AsyncInferencer:
                     yield chunk
             return
 
-        segments = [self.normalizer.normalize(s) for s in self.normalizer.split_text(text)]
+        segments = [
+            self.normalizer.normalize(s) for s in self.normalizer.split_text(text)
+        ]
         segments = [s for s in segments if s]
         if not segments:
             return
 
         semaphore = asyncio.Semaphore(4)
 
-        async def stream_segment(segment: str, queue: asyncio.Queue[bytes | None]) -> None:
+        async def stream_segment(
+            segment: str,
+            queue: asyncio.Queue[bytes | None],
+            emit_header: bool,
+        ) -> None:
             async with semaphore:
                 async with self.client.audio.speech.with_streaming_response.create(
                     model=model,
-                    voice=voice,
+                    voice=self.voice_map.get(voice, voice),
                     input=segment,
                     response_format="wav",
                 ) as response:
-                    async for chunk in response.iter_bytes():
+                    postprocessor = AudioPostProcessor(emit_header=emit_header)
+                    async for chunk in postprocessor.process_wav_stream(
+                        response.iter_bytes()
+                    ):
                         await queue.put(chunk)
             await queue.put(None)
 
-        queues = [asyncio.Queue() for _ in segments]
+        async with self.client.audio.speech.with_streaming_response.create(
+            model=model,
+            voice=self.voice_map.get(voice, voice),
+            input=segments[0],
+            response_format="wav",
+        ) as response:
+            postprocessor = AudioPostProcessor(emit_header=True)
+            async for chunk in postprocessor.process_wav_stream(response.iter_bytes()):
+                yield chunk
+
+        if len(segments) == 1:
+            return
+
+        queues = [asyncio.Queue() for _ in segments[1:]]
         tasks = [
-            asyncio.create_task(stream_segment(segment, queue))
-            for segment, queue in zip(segments, queues)
+            asyncio.create_task(stream_segment(segment, queue, False))
+            for segment, queue in zip(segments[1:], queues)
         ]
 
         try:
@@ -88,7 +114,10 @@ class AsyncInferencer:
             model=model,
             messages=[
                 {"role": "system", "content": LLM_NORMALIZE_SYSTEM_PROMPT},
-                {"role": "user", "content": LLM_NORMALIZE_USER_TEMPLATE.format(text=text)},
+                {
+                    "role": "user",
+                    "content": LLM_NORMALIZE_USER_TEMPLATE.format(text=text),
+                },
             ],
             temperature=0,
             stream=True,
